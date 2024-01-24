@@ -1,0 +1,143 @@
+#!/bin/bash
+
+# cookie & data files
+cookieFile=$(mktemp /tmp/dijnet-cookies-XXXXXX)
+dataFile=$(mktemp /tmp/dijnet-data-XXXXXX)
+
+username=""
+password=""
+searchToken=""
+
+wget="wget --user-agent=\"Mozilla/5.0\" --load-cookies ${cookieFile} --keep-session-cookies --save-cookies ${cookieFile} -q -O ${dataFile}"
+
+startPage="https://www.dijnet.hu/"
+loginPage="https://www.dijnet.hu/ekonto/login/login_check_ajax"
+mainPage="https://www.dijnet.hu/ekonto/control/main"
+searchPage="https://www.dijnet.hu/ekonto/control/szamla_search"
+searchSubmitPage="https://www.dijnet.hu/ekonto/control/szamla_search_submit"
+billsPage="https://www.dijnet.hu/ekonto/control/szamla_list"
+downloadPage="https://www.dijnet.hu/ekonto/control/szamla_letolt"
+downloadXml="https://www.dijnet.hu/ekonto/control/szamla_xml"
+downloadPdf="https://www.dijnet.hu/ekonto/control/szamla_pdf"
+
+
+function log
+{
+    text=${@}
+    echo "[dijnet-bill-downloader] ${text}"
+}
+
+
+function onError
+{
+    text=${1}
+    log "${text}"
+    rm -f ${cookieFile} ${dataFile}
+    exit 1
+}
+
+
+function openPage
+{
+    page=${1}
+    shift
+    params=${@}
+    ${wget} ${page} ${params} || onError "Failed to open page ${page}"
+}
+
+
+if [ "${DIJNET_USERNAME}" != "" ];
+then
+    username=${DIJNET_USERNAME}
+else
+    read -p "Username: " username
+fi
+
+if [ "${DIJNET_PASSWORD}" != "" ];
+then
+    password=${DIJNET_PASSWORD}
+else
+    read -p "Password: " -s password
+    echo ""
+fi
+
+
+log "Open start page"
+openPage ${startPage}
+
+log "Login"
+openPage ${loginPage} --post-data="username=${username}&password=${password}"
+grep -q "\"success\": true" ${dataFile} || onError "Failed to log in."
+
+log "Open main page"
+openPage ${mainPage}
+
+log "Open search page"
+openPage ${searchPage}
+
+log "Get token"
+searchToken=$(cat ${dataFile} | grep "vfw_token" | cut -d "\"" -f 6)
+
+log "List bills"
+openPage ${searchSubmitPage} --post-data="vfw_form=szamla_search_submit&vfw_token=${searchToken}&vfw_coll=szamla_search_params&szlaszolgnev=&regszolgid=&datumtol=&datumig="
+ids=$(grep "clickSzamla('szamla_select'" ${dataFile} | cut -d ',' -f 2 | cut -d ")" -f 1 | tr -d ' ')
+maxId=$(grep "clickSzamla('szamla_select'" ${dataFile} | cut -d ',' -f 2 | cut -d ")" -f 1 | tr -d ' ' | sort -n | tail -n 1)
+
+log "Found $[ ${maxId} + 1 ] bill(s)"
+
+for id in ${ids}
+do
+    prefix="[${id}/${maxId}]"
+    log ${prefix} "Open bills page"
+    openPage ${billsPage}
+
+    log ${prefix} "Open bill"
+    openPage "https://www.dijnet.hu/ekonto/control/szamla_select?vfw_coll=szamla_list&vfw_rowid=${id}"
+
+    log ${prefix} "Open download tab"
+    openPage ${downloadPage}
+    
+    log ${prefix} "Download XML"
+    openPage ${downloadXml}
+
+    company=$(cat ${dataFile} | iconv -f ISO_8859-2 -t ascii//TRANSLIT | grep "<nev>" | head -n 1 | cut -d ">" -f 2 | cut -d "<" -f 1)
+    issueDate=$(cat ${dataFile} | iconv -f ISO_8859-2 -t ascii//TRANSLIT | grep -E "<kialldatum>|<szladatum>" | cut -d ">" -f 2 | cut -d "<" -f 1)
+
+    if [ "${company}" == "" ];
+    then
+        onError "Empty company name"
+    fi
+
+    if [ "${issueDate}" == "" ];
+    then
+        onError "Empty issue date"
+    fi
+
+    # Format YYYY.MM.DD. to YYYY-MM-DD
+    issueDate=$(echo ${issueDate} | sed "s/\([0-9]\{4\}\)\.\([0-9]\{2\}\)\.\([0-9]\{2\}\)\./\1-\2-\3/g")
+
+    # Format company name
+    company=$(echo ${company} | tr -d '.' | tr ' ' '-')
+
+    log ${prefix} "Bill:" ${company} "(${issueDate})"
+    mkdir -p ${company}
+    
+    pdfFile="${company}/${issueDate}.pdf"
+    xmlFile="${company}/${issueDate}.xml"
+
+    log ${prefix} "Save XML file:" ${xmlFile}
+    cp ${dataFile} ${xmlFile}
+    file -b --mime-type ${xmlFile} | grep -q "text/xml" || onError "Downloaded file is not an XML file!"
+
+    log ${prefix} "Download PDF"
+    openPage ${downloadPdf}
+
+    log ${prefix} "Save PDF file:" ${pdfFile}
+    cp ${dataFile} ${pdfFile}
+    # Some PDF files starts with 'OK %PDF-' instead of '%PDF-' and unfortunatelly the 'file' command can't tackle it
+    head -c 8 ${pdfFile} | grep -q "%PDF-" || onError "Downloaded file is not a PDF file!"
+    
+done
+
+rm -f ${cookieFile} ${dataFile}
+
